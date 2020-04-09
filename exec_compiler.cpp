@@ -10,12 +10,17 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include <fcntl.h>
+
+#include "util.h"
 
 namespace fs = std::filesystem;
 
 static std::string execLogPrefix{"exec.log."};
+
+static std::set<std::string> compilerInvocations{"clang", "clang++", "gcc", "cc", "c++", "g++"};
 
 static fs::path ownPath() {
 	char buf[4096];
@@ -156,7 +161,9 @@ void logExec(const fs::path &exe, char **argv) {
 }
 
 int execCompiler(int argc, char **argv) {
-	fs::path pathToExec = getOriginalPath(argv[0]);
+	fs::path ccBinDirPath = fs::path{getenv("CC_BINDIR")};
+	fs::path argvPath = fs::path{argv[0]};
+	fs::path pathToExec = ccBinDirPath / argvPath.filename();
 
 	if (pathToExec.empty()) {
 		errno = ENOENT;
@@ -174,7 +181,7 @@ int execCompiler(int argc, char **argv) {
 #endif
 
 	// gcc has a weird bug if argv[0] == "./gcc"
-	argv[0] = strdup(pathToExec.string().c_str());
+	argv[0] = strdup(pathToExec.filename().string().c_str());
 	execvp(pathToExec.string().c_str(), argv);
 
 	free(argv[0]);
@@ -183,29 +190,65 @@ int execCompiler(int argc, char **argv) {
 }
 
 void bindMount(const fs::path &from, const fs::path &to) {
-
+	if (!fs::exists(to)) {
+		std::ofstream toFileHandle(to);
+		toFileHandle << "";
+	}
+	std::cout << "bindMount: " << from << " --> " << to << std::endl;
+	mount(from.string().c_str(), to.string().c_str(), "none", MS_BIND, NULL);
 }
 
 int invocateBuild(char **argv) {
 	int status = -1;
 	pid_t pid = -1;
 
-	char *tmpDir = strdup("cc-logdir-XXXXXX");
+	TemporaryDir logDir("/tmp/cc-logdir-XXXXXX");
+	TemporaryDir binDir("/tmp/cc-bindir-XXXXXX");
 
-	if (mkdtemp(tmpDir) == nullptr) {
-		std::cerr << "mkdtemp failed: " << strerror(errno) << std::endl;
-		exit(-1);
-	}
-	fs::path tmpDirPath{tmpDir};
-	tmpDirPath = fs::canonical(tmpDirPath);
-
+	uid_t uid = getuid();
+	gid_t gid = getgid();
 	pid = fork();
 	if (pid == 0) {
-		std::string pathEnvVar = std::string{getenv("PATH")};
+		unshare(CLONE_NEWNS|CLONE_NEWUSER|CLONE_NEWPID);
+		if (fork()) {
+			int status = -1;
+			wait(&status);
+			exit(status);
+		}
+		//std::string pathEnvVar = std::string{getenv("PATH")};
 		// memory leak ahead
-		pathEnvVar = std::string{get_current_dir_name()} + ":" + pathEnvVar;
-		setenv("PATH", pathEnvVar.c_str(), 1);
-		setenv("CC_LOGDIR", tmpDirPath.string().c_str(), 1);
+		//pathEnvVar = std::string{get_current_dir_name()} + ":" + pathEnvVar;
+		//setenv("PATH", pathEnvVar.c_str(), 1);
+		mount("none", "/", NULL, MS_REC|MS_PRIVATE, NULL);
+		mount("none", "/proc", NULL, MS_REC|MS_PRIVATE, NULL);
+		char mappingBuf[512];
+		int setgroupFd = open( "/proc/self/setgroups", O_WRONLY);
+		write(setgroupFd, "deny", 4);
+		close(setgroupFd);
+		int uid_mapFd = open("/proc/self/uid_map", O_WRONLY);
+		snprintf(mappingBuf, 512, "0 %d 1", uid);
+		write(uid_mapFd, mappingBuf, strlen(mappingBuf));
+		close(uid_mapFd);
+		int gid_mapFd = open("/proc/self/gid_map", O_WRONLY);
+		snprintf(mappingBuf, 512, "0 %d 1", gid);
+		write(uid_mapFd, mappingBuf, strlen(mappingBuf));
+		close(gid_mapFd);
+		for (const auto &compilerBin : compilerInvocations) {
+			fs::path origPath = getOriginalPath(compilerBin);
+			if (origPath.empty()) {
+				continue;
+			}
+			bindMount(origPath, binDir.path() / compilerBin);
+		}
+		for (const auto &compilerBin : compilerInvocations) {
+			fs::path origPath = getOriginalPath(compilerBin);
+			if (origPath.empty()) {
+				continue;
+			}
+			bindMount(fs::canonical(fs::path{"ec"}), origPath);
+		}
+		setenv("CC_LOGDIR", logDir.string().c_str(), 1);
+		setenv("CC_BINDIR", binDir.string().c_str(), 1);
 		execvp(argv[0], argv);
 	} else if (pid < 0) {
 		std::cerr << "fork failed: " << strerror(errno) << std::endl;
@@ -217,11 +260,11 @@ int invocateBuild(char **argv) {
 		exit(-1);
 	}
 	printf(">>> %d\n", status);
-	std::cout << tmpDirPath << std::endl;
+	std::cout << logDir.string() << std::endl;
 
 	int count = 1;
 	while (count < std::numeric_limits<int>::max()) {
-		fs::path logfile = tmpDirPath / (execLogPrefix + std::to_string(count));
+		fs::path logfile = logDir.path() / (execLogPrefix + std::to_string(count));
 		if (!fs::exists(logfile)) {
 			break;
 		}
@@ -236,14 +279,10 @@ int invocateBuild(char **argv) {
 		count++;
 	}
 
-	fs::remove_all(tmpDirPath);
-
 	return status;
 }
 
 int main(int argc, char **argv) {
-	std::set<std::string> compilerInvocations{"clang", "clang++", "gcc", "cc", "c++", "g++"};
-
 	fs::path ownCmd = fs::path{argv[0]}.filename();
 	if (compilerInvocations.count(ownCmd.string()) > 0) {
 		std::cout << "starting: " << ownCmd << std::endl;
