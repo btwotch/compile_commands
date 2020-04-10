@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include "nlohmann/json.hpp"
 #include "util.h"
 
 namespace fs = std::filesystem;
@@ -142,7 +143,7 @@ void logExec(const fs::path &exe, char **argv) {
 	}
 
 	execLogFile << "CWD: " << currentDir << '\n';
-	execLogFile << "FILE: " << file << '\n';
+	execLogFile << "FILE: " << file.string() << '\n';
 	execLogFile << "CMD: " << exe.string();
 	for (int i = 1; argv[i] != nullptr; i++) {
 		execLogFile << " " << argv[i];
@@ -182,6 +183,25 @@ void bindMount(const fs::path &from, const fs::path &to) {
 		std::cerr << "mounting " << from << " to " << to << " failed: " << strerror(errno);
 		exit(-1);
 	}
+}
+
+void populateJson(const fs::path &file, nlohmann::json &json) {
+	nlohmann::json elem;
+	std::ifstream logfileStream;
+	logfileStream.open(file);
+
+	std::string line;
+	while (std::getline(logfileStream, line)) {
+		if (line.rfind("CWD: ", 0) == 0) {
+			elem["directory"] = line.substr(5);
+		} else if (line.rfind("CMD: ", 0) == 0) {
+			elem["command"] = line.substr(5);
+		} else if (line.rfind("FILE: ", 0) == 0) {
+			elem["file"] = line.substr(6);
+		}
+	}
+
+	json.push_back(elem);
 }
 
 int invocateBuild(char **argv) {
@@ -245,29 +265,27 @@ int invocateBuild(char **argv) {
 	}
 
 	int count = 1;
+	nlohmann::json json;
 	while (count < std::numeric_limits<int>::max()) {
 		fs::path logfile = logDir.path() / (execLogPrefix + std::to_string(count));
 		if (!fs::exists(logfile)) {
 			break;
 		}
 
-		std::ifstream logfileStream;
-		logfileStream.open(logfile);
-
-		std::string line;
-		while (std::getline(logfileStream, line)) {
-			std::cout << ": " << line << std::endl;
-		}
+		populateJson(logfile, json);
 		count++;
 	}
 
+	std::ofstream compileCommandsStream;
+	compileCommandsStream.open("compile_commands.json");
+
+	compileCommandsStream << json.dump(4) << std::endl;
 	return status;
 }
 
 int main(int argc, char **argv) {
 	fs::path ownCmd = fs::path{argv[0]}.filename();
 	if (compilerInvocations.count(ownCmd.string()) > 0) {
-		std::cout << "starting: " << ownCmd << std::endl;
 		return execCompiler(argc, argv);
 	}
 
