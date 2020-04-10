@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <linux/limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -22,11 +23,11 @@ static std::string execLogPrefix{"exec.log."};
 
 static std::set<std::string> compilerInvocations{"clang", "clang++", "gcc", "cc", "c++", "g++"};
 
-static fs::path ownPath() {
-	char buf[4096];
+fs::path ownPath() {
+	char buf[PATH_MAX];
 
 	ssize_t length = readlink("/proc/self/exe", static_cast<char*>(buf), sizeof(buf));
-	if (length > sizeof(buf)) {
+	if (length >= static_cast<ssize_t>(sizeof(buf))) {
 		std::cerr << "link of /proc/self/exe is too long" << std::endl;
 		exit(1);
 	}
@@ -38,13 +39,11 @@ static fs::path ownPath() {
 	return exePath;
 }
 
-static fs::path ownDir() {
+fs::path ownDir() {
 	return ownPath().parent_path();
 }
 
 fs::path getOriginalPath(const std::string &exe) {
-	fs::path ownExeDir = ownDir();
-
 	std::set<fs::path> envPaths;
 
 	std::string pathEnvVar = std::string{getenv("PATH")};
@@ -53,9 +52,7 @@ fs::path getOriginalPath(const std::string &exe) {
 	std::string pathElem;
 	//envPaths.insert("/bin");
 	while(std::getline(ss, pathElem, ':')) {
-		if (pathElem != ownExeDir) {
-			envPaths.insert(pathElem);
-		}
+		envPaths.insert(pathElem);
 	}
 
 	fs::path newExePath;
@@ -119,18 +116,16 @@ std::ofstream nextLogFileHandle() {
 }
 
 fs::path detectFileFromArgv(char **argv) {
-	*argv++;
-	while (*argv != NULL) {
-		if (*argv[0] == '-') {
+	static std::set<std::string> sourceExtensions = {".cpp", ".c", ".cxx", ".c++"};
+	for (int i = 1; argv[i] != nullptr; i++) {
+		if (argv[i][0] == '-') {
 			// let's hope nobody uses files that begin with '-'
-			*argv++;
 			continue;
 		}
 
-		if (fs::exists(*argv)) {
-			return fs::path{*argv};
+		if (fs::exists(argv[i]) && sourceExtensions.count(fs::path{argv[i]}.extension()) > 0) {
+			return fs::path{argv[i]};
 		}
-		*argv++;
 	}
 
 	return fs::path{};
@@ -149,10 +144,8 @@ void logExec(const fs::path &exe, char **argv) {
 	execLogFile << "CWD: " << currentDir << '\n';
 	execLogFile << "FILE: " << file << '\n';
 	execLogFile << "CMD: " << exe.string();
-	*argv++;
-	while (*argv != NULL) {
-		execLogFile << " " << *argv;
-		*argv++;
+	for (int i = 1; argv[i] != nullptr; i++) {
+		execLogFile << " " << argv[i];
 	}
 
 	execLogFile << '\n';
@@ -169,16 +162,7 @@ int execCompiler(int argc, char **argv) {
 		errno = ENOENT;
 		return -1;
 	}
-	logExec(pathToExec, argv);
-
-#if 0
-	char **newArgv;
-	newArgv = argv;
-	while (*newArgv != NULL) {
-		printf("-- %s\n", *newArgv);
-		*newArgv++;
-	}
-#endif
+	logExec(getOriginalPath(pathToExec.filename()), argv);
 
 	// gcc has a weird bug if argv[0] == "./gcc"
 	argv[0] = strdup(pathToExec.filename().string().c_str());
@@ -194,8 +178,10 @@ void bindMount(const fs::path &from, const fs::path &to) {
 		std::ofstream toFileHandle(to);
 		toFileHandle << "";
 	}
-	std::cout << "bindMount: " << from << " --> " << to << std::endl;
-	mount(from.string().c_str(), to.string().c_str(), "none", MS_BIND, NULL);
+	if (mount(from.string().c_str(), to.string().c_str(), "none", MS_BIND, NULL) < 0) {
+		std::cerr << "mounting " << from << " to " << to << " failed: " << strerror(errno);
+		exit(-1);
+	}
 }
 
 int invocateBuild(char **argv) {
@@ -215,10 +201,6 @@ int invocateBuild(char **argv) {
 			wait(&status);
 			exit(status);
 		}
-		//std::string pathEnvVar = std::string{getenv("PATH")};
-		// memory leak ahead
-		//pathEnvVar = std::string{get_current_dir_name()} + ":" + pathEnvVar;
-		//setenv("PATH", pathEnvVar.c_str(), 1);
 		mount("none", "/", NULL, MS_REC|MS_PRIVATE, NULL);
 		mount("none", "/proc", NULL, MS_REC|MS_PRIVATE, NULL);
 		char mappingBuf[512];
@@ -247,6 +229,8 @@ int invocateBuild(char **argv) {
 			}
 			bindMount(fs::canonical(fs::path{"ec"}), origPath);
 		}
+		logDir.disableCleanup();
+		binDir.disableCleanup();
 		setenv("CC_LOGDIR", logDir.string().c_str(), 1);
 		setenv("CC_BINDIR", binDir.string().c_str(), 1);
 		execvp(argv[0], argv);
@@ -259,8 +243,6 @@ int invocateBuild(char **argv) {
 		std::cerr << "wait failed: " << strerror(errno) << std::endl;
 		exit(-1);
 	}
-	printf(">>> %d\n", status);
-	std::cout << logDir.string() << std::endl;
 
 	int count = 1;
 	while (count < std::numeric_limits<int>::max()) {
@@ -289,10 +271,5 @@ int main(int argc, char **argv) {
 		return execCompiler(argc, argv);
 	}
 
-	if (ownCmd != "ec") {
-		std::cout << "unknown cmd: " << ownCmd << std::endl;
-		exit(-1);
-	}
-	*argv++;
-	return invocateBuild(argv);
+	return invocateBuild(&argv[1]);
 }

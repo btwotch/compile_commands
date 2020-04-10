@@ -16,7 +16,9 @@ public:
         }
 
         ~TemporaryDir() {
-                fs::remove_all(tmpPath);
+		if (cleanup) {
+			fs::remove_all(tmpPath);
+		}
 		free(pathTemplateChar);
         }
         operator std::string() {
@@ -31,8 +33,13 @@ public:
 	fs::path path() {
 		return tmpPath;
 	}
+
+	void disableCleanup() {
+		cleanup = false;
+	}
 private:
         fs::path tmpPath;
+	bool cleanup = true;
 	char *pathTemplateChar;
 };
 
