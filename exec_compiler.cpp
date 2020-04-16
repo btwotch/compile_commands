@@ -247,7 +247,7 @@ int invocateBuild(char **argv) {
 			if (origPath.empty()) {
 				continue;
 			}
-			bindMount(fs::canonical(fs::path{"ec"}), origPath);
+			bindMount(fs::canonical(fs::path{ownPath()}), origPath);
 		}
 		logDir.disableCleanup();
 		binDir.disableCleanup();
