@@ -20,3 +20,5 @@ exit
 ```
 now you should have a compile_commands.json in your current directory
 
+#### Technical Details
+can be found here: https://btwotch.wordpress.com/2020/04/10/compile_commands-json-independent-from-cmake/
